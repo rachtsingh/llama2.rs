@@ -3,7 +3,7 @@
 use std::simd::{f32x8, i32x8, SimdFloat, SimdInt};
 // This is a conversion of llama2.c to rust.
 // It is basically line-by-line following chatgpt :)
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, Mmap};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -646,54 +646,41 @@ impl Random {
     }
 }
 
-fn main() {
-    // poor man's Rust argparse
-    // 'checkpoint' is necessary arg
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 1 {
-        println!("Usage: <checkpoint_file> [temperature] [steps] [prompt]");
-        return;
-    }
-    let checkpoint = args[0].clone();
-    let temperature = if args.len() >= 2 {
-        args[1].parse().expect("temperature must be float")
-    } else {
-        0.9
-    };
+#[allow(dead_code)]
+struct MmappedTransformer<'a> {
+    mmap: Mmap,
+    config: Config,
+    weights: &'a TWeights
+}
 
-    let mut steps = if args.len() >= 3 {
-        args[2].parse().expect("steps must be int")
-    } else {
-        256
-    };
-    let prompt = args.get(3).unwrap_or(&String::from("")).to_owned();
-
-    let mut random = Random::new();
-    // read in the model.bin file
-    let mut file = File::open(&checkpoint).unwrap();
-
-    // Config
-    let config = Config::load(&mut file);
+// NOTE: uses unsafe (mmap)
+fn load_model(path: &String) -> MmappedTransformer {
+    let mut file = File::open(&path).unwrap();
+    let config: Config = Config::load(&mut file);
     io::stdout().flush().expect("flush failed");
     let start = file.seek(SeekFrom::Current(0)).unwrap();
     let mmap = unsafe { MmapOptions::new().offset(start).map(&file).unwrap() };
     assert_eq!(mmap.len(), mem::size_of::<TWeights>());
-    // let mut content = Vec::new();
-    // file.read_to_end(&mut content);
-    let weights: &'static TWeights = unsafe { &*(mmap.as_ptr() as *const TWeights) };
+    let weights: &TWeights = unsafe { &*(mmap.as_ptr() as *const TWeights) };
+    MmappedTransformer { mmap, config, weights }
+}
 
-    // right now we cannot run for more than config.seq_len steps
-    if steps <= 0 || steps > config.seq_len {
-        steps = config.seq_len;
-    }
 
-    let tokenizer = {
-        let mut file = File::open("tokenizer.bin").unwrap();
-        Tokenizer::load(&mut file, &config)
-    };
 
+// Generates `steps` tokens and returns the total time taken + a vector of the generated tokens.
+fn generate<'a>(
+    config: &Config,
+    weights: &QTransformerWeights,
+    tokenizer: &'a Tokenizer,
+    prompt: &str,
+    steps: usize,
+    random: &mut Random,
+    temperature: fx,
+    print_tokens: bool
+) -> (i64, Vec<&'a str>) {
     // create and init the application RunState
     let mut state: Box<RunState> = RunState::new();
+
     // process the prompt, if any
     let prompt_tokens = if !prompt.is_empty() {
         tokenizer.bpe_encode(&prompt)
@@ -701,12 +688,17 @@ fn main() {
         Vec::new()
     };
 
+    let mut ret = Vec::new(); // will store the generated tokens
+
     // start the main loop
     let mut start = 0; // used to time our code, only initialized after first iteration
     let mut next; // will store the next token in the sequence
     let mut token: Token = 1; // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     let mut pos = 0; // position in the sequence
-    println!("<s>"); // explicit print the initial BOS token for stylistic symmetry reasons
+
+    if print_tokens {
+        println!("<s>"); // explicit print the initial BOS token for stylistic symmetry reasons
+    }
     while pos < steps {
         // forward the transformer to get logits for the next token
         transformer(token, pos, &mut state, &weights);
@@ -730,15 +722,18 @@ fn main() {
             }
         };
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-        //println!("{} {}", next, state.logits[next]);
 
         let token_str = if token == 1 && tokenizer.vocab[next].starts_with(' ') {
             &tokenizer.vocab[next][1..]
         } else {
             &tokenizer.vocab[next]
         };
-        print!("{}", token_str);
-        io::stdout().flush().expect("flush failed");
+        ret.push(token_str);
+
+        if print_tokens {
+            print!("{}", token_str);
+            io::stdout().flush().expect("flush failed");
+        }
 
         // advance forward
         token = next;
@@ -748,11 +743,62 @@ fn main() {
             start = time_in_ms();
         }
     }
+    ((time_in_ms() - start), ret)
+}
+
+fn load_tokenizer(path: &str, config: &Config) -> Tokenizer {
+    let mut file = File::open(path).unwrap();
+    Tokenizer::load(&mut file, config)
+}
+
+fn main() {
+    // poor man's Rust argparse
+    // 'checkpoint' is necessary arg
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() < 1 {
+        println!("Usage: <checkpoint_file> [temperature] [steps] [prompt]");
+        return;
+    }
+    let checkpoint = args[0].clone();
+    let temperature = if args.len() >= 2 {
+        args[1].parse().expect("temperature must be float")
+    } else {
+        0.9
+    };
+
+    let mut steps = if args.len() >= 3 {
+        args[2].parse().expect("steps must be int")
+    } else {
+        256
+    };
+    let prompt = args.get(3).unwrap_or(&String::from("")).to_owned();
+
+    let mut random = Random::new();
+
+    // read in the model.bin file
+    let transformer = load_model(&checkpoint);
+
+    // right now we cannot run for more than config.seq_len steps
+    if steps <= 0 || steps > transformer.config.seq_len {
+        steps = transformer.config.seq_len;
+    }
+
+    let tokenizer = load_tokenizer("tokenizer.bin", &transformer.config);
+
+    let (gen_time, _) = generate(
+        &transformer.config,
+        transformer.weights,
+        &tokenizer,
+        &prompt,
+        steps,
+        &mut random,
+        temperature,
+        true
+    );
 
     // report achieved tok/s
-    let end = time_in_ms();
     println!(
         "\nachieved tok/s: {}",
-        (steps - 1) as fx / (end - start) as fx * 1000.0
+        ((steps - 1) as fx / gen_time as fx) * 1000.0
     );
 }
