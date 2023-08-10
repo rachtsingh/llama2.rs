@@ -19,8 +19,6 @@ To build, you'll need the nightly toolchain, which is used by default:
 > cargo build --release
 ```
 
-If you get a build error you may need to change .cargo/config to match your chipset.
-
 To get model (loads [70B quantized](https://huggingface.co/TheBloke/llama-2-70b-Guanaco-QLoRA-GPTQ)):
 
 ```
