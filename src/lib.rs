@@ -1,5 +1,9 @@
 #![feature(portable_simd)]
 
+use pyo3::{Python, exceptions};
+use pyo3::{prelude::*, wrap_pyfunction};
+use pyo3::types::{PyDict, PyList};
+
 use std::simd::{f32x8, i32x8, SimdFloat, SimdInt};
 // This is a conversion of llama2.c to rust.
 // It is basically line-by-line following chatgpt :)
@@ -9,7 +13,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, io};
+use std::io;
 
 // Configuration for Llama 70B. Others in config.txt
 // set these configuration options using .cargo/config
@@ -62,7 +66,7 @@ const GROUPSIZE: usize = 128;
 
 // Eventually will move to f16
 #[allow(non_camel_case_types)]
-type fx = f32;
+pub type fx = f32;
 
 // Some helpers for reading from binary files.
 fn read_usize(file: &mut File) -> usize {
@@ -103,15 +107,15 @@ fn argmax(v: &[fx]) -> usize {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-struct Config {
-    dim: usize,        // transformer dimension
-    hidden_dim: usize, // for ffn layers
-    n_layers: usize,   // number of layers
-    n_heads: usize,    // number of query heads
-    n_kv_heads: usize, // number of key/value heads (can be < query heads because of multiquery)
-    vocab_size: usize, // vocabulary size, usually 256 (byte-level)
-    seq_len: usize,    // max sequence length
-    shared_weight: bool,
+pub struct Config {
+    pub dim: usize,        // transformer dimension
+    pub hidden_dim: usize, // for ffn layers
+    pub n_layers: usize,   // number of layers
+    pub n_heads: usize,    // number of query heads
+    pub n_kv_heads: usize, // number of key/value heads (can be < query heads because of multiquery)
+    pub vocab_size: usize, // vocabulary size, usually 256 (byte-level)
+    pub seq_len: usize,    // max sequence length
+    pub shared_weight: bool,
 }
 
 // This config is mostly ignored.
@@ -337,7 +341,7 @@ struct QTransformerWeights {
 type Token = usize;
 
 #[derive(Debug)]
-struct Tokenizer {
+pub struct Tokenizer {
     vocab: Vec<String>,
     vocab_scores: Vec<fx>,
     max_token_length: usize,
@@ -605,11 +609,11 @@ fn time_in_ms() -> i64 {
     time.as_secs() as i64 * 1000 + time.subsec_millis() as i64
 }
 
-struct Random {
+pub struct Random {
     seed: u64,
 }
 impl Random {
-    fn new() -> Random {
+    pub fn new() -> Random {
         // seed rng with time. if you want deterministic behavior use temperature 0.0
         Random {
             seed: SystemTime::now()
@@ -647,14 +651,14 @@ impl Random {
 }
 
 #[allow(dead_code)]
-struct MmappedTransformer<'a> {
+pub struct MmappedTransformer<'a> {
     mmap: Mmap,
-    config: Config,
+    pub config: Config,
     weights: &'a TWeights
 }
 
 // NOTE: uses unsafe (mmap)
-fn load_model(path: &String) -> MmappedTransformer {
+pub fn load_model(path: &String) -> MmappedTransformer {
     let mut file = File::open(&path).unwrap();
     let config: Config = Config::load(&mut file);
     io::stdout().flush().expect("flush failed");
@@ -668,9 +672,8 @@ fn load_model(path: &String) -> MmappedTransformer {
 
 
 // Generates `steps` tokens and returns the total time taken + a vector of the generated tokens.
-fn generate<'a>(
-    config: &Config,
-    weights: &QTransformerWeights,
+pub fn generate<'a>(
+    model: &MmappedTransformer,
     tokenizer: &'a Tokenizer,
     prompt: &str,
     steps: usize,
@@ -678,6 +681,8 @@ fn generate<'a>(
     temperature: fx,
     print_tokens: bool
 ) -> (i64, Vec<&'a str>) {
+    let config = &model.config;
+    let weights = model.weights;
     // create and init the application RunState
     let mut state: Box<RunState> = RunState::new();
 
@@ -746,59 +751,7 @@ fn generate<'a>(
     ((time_in_ms() - start), ret)
 }
 
-fn load_tokenizer(path: &str, config: &Config) -> Tokenizer {
+pub fn load_tokenizer(path: &str, config: &Config) -> Tokenizer {
     let mut file = File::open(path).unwrap();
     Tokenizer::load(&mut file, config)
-}
-
-fn main() {
-    // poor man's Rust argparse
-    // 'checkpoint' is necessary arg
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 1 {
-        println!("Usage: <checkpoint_file> [temperature] [steps] [prompt]");
-        return;
-    }
-    let checkpoint = args[0].clone();
-    let temperature = if args.len() >= 2 {
-        args[1].parse().expect("temperature must be float")
-    } else {
-        0.9
-    };
-
-    let mut steps = if args.len() >= 3 {
-        args[2].parse().expect("steps must be int")
-    } else {
-        256
-    };
-    let prompt = args.get(3).unwrap_or(&String::from("")).to_owned();
-
-    let mut random = Random::new();
-
-    // read in the model.bin file
-    let transformer = load_model(&checkpoint);
-
-    // right now we cannot run for more than config.seq_len steps
-    if steps <= 0 || steps > transformer.config.seq_len {
-        steps = transformer.config.seq_len;
-    }
-
-    let tokenizer = load_tokenizer("tokenizer.bin", &transformer.config);
-
-    let (gen_time, _) = generate(
-        &transformer.config,
-        transformer.weights,
-        &tokenizer,
-        &prompt,
-        steps,
-        &mut random,
-        temperature,
-        true
-    );
-
-    // report achieved tok/s
-    println!(
-        "\nachieved tok/s: {}",
-        ((steps - 1) as fx / gen_time as fx) * 1000.0
-    );
 }

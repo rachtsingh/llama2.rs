@@ -8,6 +8,17 @@ edition = "2021"
 [dependencies]
 memmap2 = "0.7"
 rayon = "1.5"
+pyo3 = "0.18.1"
+pythonize = "0.18.0"
+
+[lib]
+name = "llama2_rs"
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "llama2_rs"
+path = "src/bin.rs"
 
 [profile.release]
 debug = true
