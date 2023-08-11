@@ -609,6 +609,7 @@ fn time_in_ms() -> i64 {
     time.as_secs() as i64 * 1000 + time.subsec_millis() as i64
 }
 
+#[pyclass]
 pub struct Random {
     seed: u64,
 }
@@ -668,8 +669,6 @@ pub fn load_model(path: &String) -> MmappedTransformer {
     let weights: &TWeights = unsafe { &*(mmap.as_ptr() as *const TWeights) };
     MmappedTransformer { mmap, config, weights }
 }
-
-
 
 // Generates `steps` tokens and returns the total time taken + a vector of the generated tokens.
 pub fn generate<'a>(
@@ -755,3 +754,9 @@ pub fn load_tokenizer(path: &str, config: &Config) -> Tokenizer {
     let mut file = File::open(path).unwrap();
     Tokenizer::load(&mut file, config)
 }
+
+// #[pymodule]
+// fn python_module(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+//     m.add_function(wrap_pyfunction!(load_tokenizer, m)?)?;
+//     Ok(())
+// }
