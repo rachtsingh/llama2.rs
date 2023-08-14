@@ -174,7 +174,7 @@ mod model {
                             let zero_simd = i32x8::splat(qz);
                             let in_pos = group * GROUPSIZE;
                             let xs = x[in_pos..in_pos + GROUPSIZE].chunks_exact(8);
-                            qweight
+                            let combine = qweight
                                 .iter()
                                 .zip(xs)
                                 .map(|(v, x)| {
@@ -182,11 +182,11 @@ mod model {
                                     let x = f32x8::from_slice(x);
                                     let num_simd = i32x8::splat(*v);
                                     let qw: i32x8 = (num_simd >> shift_right) & mask_4bits;
-                                    let combine: f32x8 = (qw - zero_simd).cast::<f32>();
-                                    let weight: f32x8 = scale_simd * combine;
+                                    let weight: f32x8 = (qw - zero_simd).cast::<f32>();
                                     weight * x
                                 })
-                                .fold(zero, |x, y| x + y)
+                                .fold(zero, |x, y| x + y);
+                            combine * scale_simd
                         })
                         .fold(zero, |x, y| x + y);
                     *o = collect.reduce_sum();
