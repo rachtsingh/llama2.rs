@@ -2,13 +2,15 @@
 
 // This is a conversion of llama2.c to rust.
 // It is basically line-by-line following chatgpt :)
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, Mmap};
+use pyo3::types::PyModule;
+use pyo3::{pyclass, pyfunction, Python, PyResult, pymodule, wrap_pyfunction, pymethods};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, io};
+use std::io;
 
 // Configuration for Llama 70B. Others in config.txt
 // set these configuration options using .cargo/config
@@ -268,17 +270,18 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct Config {
-    dim: usize,        // transformer dimension
-    hidden_dim: usize, // for ffn layers
-    n_layers: usize,   // number of layers
-    n_heads: usize,    // number of query heads
-    n_kv_heads: usize, // number of key/value heads (can be < query heads because of multiquery)
-    vocab_size: usize, // vocabulary size, usually 256 (byte-level)
-    seq_len: usize,    // max sequence length
-    shared_weight: bool,
+#[pyclass]
+pub struct Config {
+    pub dim: usize,        // transformer dimension
+    pub hidden_dim: usize, // for ffn layers
+    pub n_layers: usize,   // number of layers
+    pub n_heads: usize,    // number of query heads
+    pub n_kv_heads: usize, // number of key/value heads (can be < query heads because of multiquery)
+    pub vocab_size: usize, // vocabulary size, usually 256 (byte-level)
+    pub seq_len: usize,    // max sequence length
+    pub shared_weight: bool,
 }
 
 // This config is mostly ignored.
@@ -353,7 +356,8 @@ impl RunState {
 type Token = usize;
 
 #[derive(Debug)]
-struct Tokenizer {
+#[pyclass]
+pub struct Tokenizer {
     vocab: Vec<String>,
     vocab_scores: Vec<f32>,
     max_token_length: usize,
@@ -621,11 +625,15 @@ fn time_in_ms() -> i64 {
     time.as_secs() as i64 * 1000 + time.subsec_millis() as i64
 }
 
-struct Random {
+#[pyclass]
+pub struct Random {
     seed: u64,
 }
+
+#[pymethods]
 impl Random {
-    fn new() -> Random {
+    #[new]
+    pub fn new() -> Random {
         // seed rng with time. if you want deterministic behavior use temperature 0.0
         Random {
             seed: SystemTime::now()
@@ -634,7 +642,9 @@ impl Random {
                 .as_secs() as u64,
         }
     }
+}
 
+impl Random {
     fn random_u32(self: &mut Self) -> u32 {
         // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
         self.seed ^= self.seed >> 12;
@@ -662,54 +672,47 @@ impl Random {
     }
 }
 
-fn main() {
-    // poor man's Rust argparse
-    // 'checkpoint' is necessary arg
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 1 {
-        println!("Usage: <checkpoint_file> [temperature] [steps] [prompt]");
-        return;
-    }
-    let checkpoint = args[0].clone();
-    let temperature = if args.len() >= 2 {
-        args[1].parse().expect("temperature must be float")
-    } else {
-        0.9
-    };
+#[allow(dead_code)]
+#[pyclass]
+pub struct LoadedModel {
+    mmap: Mmap,
+    #[pyo3(get)]
+    pub config: Config,
+    pub weights: &'static TWeights,
+}
 
-    let mut steps = if args.len() >= 3 {
-        args[2].parse().expect("steps must be int")
-    } else {
-        256
-    };
-    let prompt = args.get(3).unwrap_or(&String::from("")).to_owned();
-
-    let mut random = Random::new();
-    // read in the model.bin file
-    let mut file = File::open(&checkpoint).unwrap();
-
-    // Config
-    let config = Config::load(&mut file);
+#[pyfunction]
+pub fn load_model(path: &str) -> LoadedModel {
+    let mut file = File::open(path).unwrap();
+    let config: Config = Config::load(&mut file);
     io::stdout().flush().expect("flush failed");
     let start = file.seek(SeekFrom::Current(0)).unwrap();
     let mmap = unsafe { MmapOptions::new().offset(start).map(&file).unwrap() };
     assert_eq!(mmap.len(), mem::size_of::<TWeights>());
-    // let mut content = Vec::new();
-    // file.read_to_end(&mut content);
-    let weights: &'static TWeights = unsafe { &*(mmap.as_ptr() as *const TWeights) };
+    let weights: &TWeights = unsafe { &*(mmap.as_ptr() as *const TWeights) };
+    LoadedModel { mmap, config, weights }
+}
 
-    // right now we cannot run for more than config.seq_len steps
-    if steps <= 0 || steps > config.seq_len {
-        steps = config.seq_len;
-    }
+#[pyfunction]
+pub fn load_tokenizer(path: &str, config: &Config) -> Tokenizer {
+    let mut file = File::open(path).unwrap();
+    Tokenizer::load(&mut file, config)
+}
 
-    let tokenizer = {
-        let mut file = File::open("tokenizer.bin").unwrap();
-        Tokenizer::load(&mut file, &config)
-    };
-
+// Generates `steps` tokens and returns the total time taken + a vector of the generated tokens.
+#[pyfunction]
+pub fn generate(
+    model: &LoadedModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    steps: usize,
+    random: &mut Random,
+    temperature: f32,
+    print_tokens: bool
+) -> (i64, Vec<String>) {
     // create and init the application RunState
     let mut state: Box<RunState> = RunState::new();
+
     // process the prompt, if any
     let prompt_tokens = if !prompt.is_empty() {
         tokenizer.bpe_encode(&prompt)
@@ -717,15 +720,20 @@ fn main() {
         Vec::new()
     };
 
+    let mut ret = Vec::new(); // will store the generated tokens
+
     // start the main loop
     let mut start = 0; // used to time our code, only initialized after first iteration
     let mut next; // will store the next token in the sequence
     let mut token: Token = 1; // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     let mut pos = 0; // position in the sequence
-    println!("<s>"); // explicit print the initial BOS token for stylistic symmetry reasons
+
+    if print_tokens {
+        println!("<s>"); // explicit print the initial BOS token for stylistic symmetry reasons
+    }
     while pos < steps {
         // forward the transformer to get logits for the next token
-        transformer(token, pos, &mut state, &weights);
+        transformer(token, pos, &mut state, &model.weights);
         if pos < prompt_tokens.len() {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
@@ -736,25 +744,28 @@ fn main() {
                 next = argmax(&state.logits);
             } else {
                 // apply the temperature to the logits
-                for q in 0..config.vocab_size {
+                for q in 0..model.config.vocab_size {
                     state.logits[q] /= temperature;
                 }
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(&mut state.logits[..VOCAB_SIZE]);
                 // we sample from this distribution to get the next token
-                next = random.sample(&state.logits, config.vocab_size);
+                next = random.sample(&state.logits, model.config.vocab_size);
             }
         };
         // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-        //println!("{} {}", next, state.logits[next]);
 
         let token_str = if token == 1 && tokenizer.vocab[next].starts_with(' ') {
             &tokenizer.vocab[next][1..]
         } else {
             &tokenizer.vocab[next]
         };
-        print!("{}", token_str);
-        io::stdout().flush().expect("flush failed");
+        ret.push(token_str.to_string());
+
+        if print_tokens {
+            print!("{}", token_str);
+            io::stdout().flush().expect("flush failed");
+        }
 
         // advance forward
         token = next;
@@ -764,11 +775,16 @@ fn main() {
             start = time_in_ms();
         }
     }
+    ((time_in_ms() - start), ret)
+}
 
-    // report achieved tok/s
-    let end = time_in_ms();
-    println!(
-        "\nachieved tok/s: {}",
-        (steps - 1) as f32 / (end - start) as f32 * 1000.0
-    );
+#[pymodule]
+fn llama2_rs(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<LoadedModel>()?;
+    m.add_class::<Tokenizer>()?;
+    m.add_class::<Random>()?;
+    m.add_function(wrap_pyfunction!(load_model, m)?)?;
+    m.add_function(wrap_pyfunction!(load_tokenizer, m)?)?;
+    m.add_function(wrap_pyfunction!(generate, m)?)?;
+    Ok(())
 }

@@ -52,6 +52,26 @@ The only thing that is certain in life is change.
 achieved tok/s: 7.9735823
 ```
 
+### Python
+
+You can also use this as a Python module (currently for testing):
+
+```
+pip install maturin
+maturin develop --release
+```
+
+You might need to specify a `--target` to maturin (e.g. `--target x86_64-unknown-linux-gnu`).
+
+Then you can generate as follows:
+
+```python
+model = llama2_rs.load_model("llama2-13b-q.bin")
+tokenizer = llama2_rs.load_tokenizer("tokenizer.bin", model.config)
+random = llama2_rs.Random()
+response = llama2_rs.generate(model, tokenizer, "The only thing", 11, random, 0.0, True)
+```
+
 ### Configuration
 
 In order to make the model as fast as possible, you need to compile a new version to adapt to other Llama versions. Currently in `.cargo/config`. The model will fail if these disagree with the binary model that is being loaded. 
